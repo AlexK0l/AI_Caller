@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI-обзвон САТ</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; color: #1f2937; }
+    h1 { margin-bottom: 8px; }
+    .muted { color: #6b7280; }
+    .card { border: 1px solid #d1d5db; border-radius: 12px; padding: 20px; margin: 18px 0; }
+    label { display: block; font-weight: 600; margin: 12px 0 6px; }
+    input[type=password], input[type=file] { width: 100%; box-sizing: border-box; padding: 10px; }
+    button, a.button { display: inline-block; margin-top: 12px; padding: 10px 16px; border: 0; border-radius: 8px; background: #111827; color: white; text-decoration: none; cursor: pointer; }
+    button.secondary { background: #374151; }
+    pre { white-space: pre-wrap; background: #f3f4f6; padding: 12px; border-radius: 8px; overflow: auto; }
+    .ok { color: #047857; }
+    .bad { color: #b91c1c; }
+  </style>
+</head>
+<body>
+  <h1>AI-обзвон клиентов САТ</h1>
+  <p class="muted">Загрузите Excel. Перед стартом система обновит базу знаний с каталога satpricep.by. Агент не должен использовать сведения о продукции из других источников.</p>
+
+  <div class="card">
+    <a class="button" href="/template.xlsx">Скачать шаблон Excel</a>
+    <label for="apiKey">CALL_API_KEY</label>
+    <input id="apiKey" type="password" autocomplete="off" />
+    <label for="file">База клиентов (.xlsx)</label>
+    <input id="file" type="file" accept=".xlsx" />
+    <button id="upload">Загрузить и проверить</button>
+  </div>
+
+  <div class="card">
+    <button id="sync" class="secondary">Обновить каталог сейчас</button>
+    <pre id="catalog">Каталог: проверка...</pre>
+  </div>
+
+  <div class="card">
+    <button id="start" disabled>Запустить обзвон</button>
+    <pre id="result">Кампания ещё не загружена.</pre>
+  </div>
+
+<script>
+let campaignId = null;
+const apiKey = () => document.getElementById('apiKey').value;
+const result = document.getElementById('result');
+const catalog = document.getElementById('catalog');
+
+async function jsonFetch(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: { ...(options.headers || {}), 'x-api-key': apiKey() },
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.message || body.error || `HTTP ${response.status}`);
+  return body;
+}
+
+async function refreshCatalog() {
+  try {
+    const data = await fetch('/catalog/status').then(r => r.json());
+    catalog.textContent = JSON.stringify(data, null, 2);
+  } catch (e) { catalog.textContent = e.message; }
+}
+
+async function refreshCampaign() {
+  if (!campaignId) return;
+  try {
+    const data = await jsonFetch(`/campaigns/${campaignId}`);
+    result.textContent = JSON.stringify(data, null, 2);
+    if (['queued','running'].includes(data.status)) setTimeout(refreshCampaign, 2000);
+  } catch (e) { result.textContent = e.message; }
+}
+
+document.getElementById('upload').onclick = async () => {
+  const file = document.getElementById('file').files[0];
+  if (!file) return alert('Выберите .xlsx файл');
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    const data = await jsonFetch('/campaigns/upload', { method: 'POST', body: form });
+    campaignId = data.campaignId;
+    result.textContent = JSON.stringify(data, null, 2);
+    document.getElementById('start').disabled = data.validClients === 0;
+  } catch (e) { result.textContent = e.message; }
+};
+
+document.getElementById('start').onclick = async () => {
+  if (!campaignId) return;
+  document.getElementById('start').disabled = true;
+  try {
+    const data = await jsonFetch(`/campaigns/${campaignId}/start`, { method: 'POST' });
+    result.textContent = JSON.stringify(data, null, 2);
+    refreshCampaign();
+  } catch (e) {
+    result.textContent = e.message;
+    document.getElementById('start').disabled = false;
+  }
+};
+
+document.getElementById('sync').onclick = async () => {
+  try {
+    catalog.textContent = 'Обновление каталога...';
+    const data = await jsonFetch('/catalog/sync', { method: 'POST' });
+    catalog.textContent = JSON.stringify(data, null, 2);
+  } catch (e) { catalog.textContent = e.message; }
+};
+
+refreshCatalog();
+</script>
+</body>
+</html>

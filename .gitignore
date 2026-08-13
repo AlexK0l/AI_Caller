@@ -1,0 +1,6 @@
+node_modules/
+.env
+data/calls/*.json
+data/call-results.jsonl
+data/do-not-call.json
+npm-debug.log*
