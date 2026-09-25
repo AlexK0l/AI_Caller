@@ -1,9 +1,9 @@
 {
   "name": "ai-client-caller-satpricep",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
-  "description": "AI-обзвон клиентов: Excel-база, Twilio, OpenAI Realtime и строгое знание продукции из satpricep.by",
+  "description": "AI-обзвон клиентов: Excel-база, Voximplant, OpenAI Realtime и строгое знание продукции из satpricep.by",
   "engines": {
     "node": ">=22"
   },
