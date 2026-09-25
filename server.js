@@ -7,18 +7,19 @@ import Fastify from 'fastify';
 import fastifyFormBody from '@fastify/formbody';
 import fastifyMultipart from '@fastify/multipart';
 import fastifyWebsocket from '@fastify/websocket';
-import twilio from 'twilio';
 import { z } from 'zod';
 import { RealtimeAgent, RealtimeSession, tool } from '@openai/agents/realtime';
-import { TwilioRealtimeTransportLayer } from '@openai/agents-extensions';
 import { CatalogKnowledgeBase } from './src/catalog.js';
 import { parseClientsExcel } from './src/excel.js';
+import { VoximplantProvider } from './src/telephony/voximplant.js';
 
 const requiredEnv = [
   'OPENAI_API_KEY',
-  'TWILIO_ACCOUNT_SID',
-  'TWILIO_AUTH_TOKEN',
-  'TWILIO_PHONE_NUMBER',
+  'VOXIMPLANT_ACCOUNT_ID',
+  'VOXIMPLANT_API_KEY',
+  'VOXIMPLANT_RULE_ID',
+  'VOXIMPLANT_PHONE_NUMBER',
+  'VOXIMPLANT_MEDIA_SECRET',
   'PUBLIC_BASE_URL',
   'CALL_API_KEY',
 ];
@@ -35,9 +36,11 @@ const config = {
   openAiApiKey: process.env.OPENAI_API_KEY,
   realtimeModel: process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-2.1',
   voice: process.env.OPENAI_VOICE || 'marin',
-  accountSid: process.env.TWILIO_ACCOUNT_SID,
-  authToken: process.env.TWILIO_AUTH_TOKEN,
-  fromNumber: process.env.TWILIO_PHONE_NUMBER,
+  voximplantAccountId: process.env.VOXIMPLANT_ACCOUNT_ID,
+  voximplantApiKey: process.env.VOXIMPLANT_API_KEY,
+  voximplantRuleId: process.env.VOXIMPLANT_RULE_ID,
+  fromNumber: process.env.VOXIMPLANT_PHONE_NUMBER,
+  mediaSecret: process.env.VOXIMPLANT_MEDIA_SECRET,
   publicBaseUrl: process.env.PUBLIC_BASE_URL.replace(/\/$/, ''),
   callApiKey: process.env.CALL_API_KEY,
   companyName: process.env.COMPANY_NAME || 'Спецавтотехника',
@@ -73,7 +76,14 @@ const TEMPLATE_FILE = path.resolve('clients-template.xlsx');
 await fs.mkdir(CALLS_DIR, { recursive: true });
 await fs.mkdir(CAMPAIGNS_DIR, { recursive: true });
 
-const twilioClient = twilio(config.accountSid, config.authToken);
+const telephony = new VoximplantProvider({
+  accountId: config.voximplantAccountId,
+  apiKey: config.voximplantApiKey,
+  ruleId: config.voximplantRuleId,
+  fromNumber: config.fromNumber,
+  mediaSecret: config.mediaSecret,
+  publicBaseUrl: config.publicBaseUrl,
+});
 const fastify = Fastify({ logger: true, bodyLimit: 10 * 1024 * 1024 });
 await fastify.register(fastifyFormBody);
 await fastify.register(fastifyMultipart, {
@@ -122,16 +132,13 @@ function publicWebsocketUrl(relativePath) {
   return url.toString();
 }
 
-function isValidTwilioWebhook(request) {
-  const signature = request.headers['x-twilio-signature'];
-  if (typeof signature !== 'string') return false;
-
-  const webhookUrl = new URL(request.raw.url, `${config.publicBaseUrl}/`).toString();
-  const params = Object.fromEntries(
-    Object.entries(request.body || {}).map(([key, value]) => [key, String(value)]),
-  );
-
-  return twilio.validateRequest(config.authToken, signature, webhookUrl, params);
+function isAllowedMediaRequest(token, signature) {
+  if (typeof signature !== 'string' || signature.length < 10) return false;
+  const expected = telephony.signMediaToken(token);
+  const actualBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+  return actualBuffer.length === expectedBuffer.length &&
+    crypto.timingSafeEqual(actualBuffer, expectedBuffer);
 }
 
 function isAllowedDestination(phone) {
@@ -163,14 +170,15 @@ async function appendResult(result) {
 }
 
 async function saveHistory(callContext, history) {
-  const safeId = callContext.callSid || callContext.token;
+  const safeId = callContext.callId || callContext.token;
   const filename = path.join(CALLS_DIR, `${safeId}.json`);
   await fs.writeFile(
     filename,
     JSON.stringify(
       {
         call: {
-          callSid: callContext.callSid,
+          callId: callContext.callId,
+          providerSessionId: callContext.providerSessionId || null,
           to: callContext.to,
           name: callContext.name,
           purpose: callContext.purpose,
@@ -239,7 +247,7 @@ function createAgent(callContext) {
     }),
     execute: async ({ status, summary, nextAction, callbackAt }) => {
       const result = {
-        callSid: callContext.callSid,
+        callId: callContext.callId,
         campaignId: callContext.campaignId || null,
         to: callContext.to,
         name: callContext.name,
@@ -263,7 +271,7 @@ function createAgent(callContext) {
     execute: async ({ reason }) => {
       await addToDnc(callContext.to, reason);
       await appendResult({
-        callSid: callContext.callSid,
+        callId: callContext.callId,
         campaignId: callContext.campaignId || null,
         to: callContext.to,
         name: callContext.name,
@@ -284,7 +292,7 @@ function createAgent(callContext) {
     execute: async ({ reason }) => {
       if (!callContext.resultSaved) {
         await appendResult({
-          callSid: callContext.callSid,
+          callId: callContext.callId,
           campaignId: callContext.campaignId || null,
           to: callContext.to,
           name: callContext.name,
@@ -296,14 +304,11 @@ function createAgent(callContext) {
         callContext.resultSaved = true;
       }
 
-      if (callContext.callSid) {
-        setTimeout(() => {
-          twilioClient
-            .calls(callContext.callSid)
-            .update({ status: 'completed' })
-            .catch((error) => fastify.log.error(error, 'Не удалось завершить звонок'));
-        }, 900);
-      }
+      setTimeout(() => {
+        telephony.hangup(callContext).catch((error) =>
+          fastify.log.error(error, 'Не удалось завершить звонок'),
+        );
+      }, 900);
       return 'Звонок будет завершён.';
     },
   });
@@ -376,7 +381,7 @@ async function createOutboundCall(payload, { campaignId = null } = {}) {
     throw error;
   }
 
-  const token = crypto.randomUUID();
+  const token = crypto.randomBytes(16).toString('hex');
   const callContext = {
     token,
     campaignId,
@@ -386,32 +391,38 @@ async function createOutboundCall(payload, { campaignId = null } = {}) {
     consentSource: data.consentSource,
     metadata: data.metadata,
     createdAt: new Date().toISOString(),
-    callSid: null,
+    callId: null,
+    providerSessionId: null,
+    bridgeSocket: null,
+    realtimeSession: null,
     resultSaved: false,
   };
 
   pendingCalls.set(token, callContext);
-  const voiceResponse = new twilio.twiml.VoiceResponse();
-  voiceResponse.connect().stream({ url: publicWebsocketUrl(`/media-stream/${token}`) });
-  const twiml = voiceResponse.toString();
 
   if (config.dryRun) {
     pendingCalls.delete(token);
-    return { dryRun: true, token, to: data.to, twiml };
+    return {
+      dryRun: true,
+      token,
+      to: data.to,
+      provider: 'voximplant',
+      mediaUrl: telephony.buildMediaUrl(token),
+    };
   }
 
   try {
-    const call = await twilioClient.calls.create({
-      to: data.to,
-      from: config.fromNumber,
-      twiml,
-      statusCallback: publicUrl(`/twilio/status/${token}`),
-      statusCallbackMethod: 'POST',
-      statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
-    });
-    callContext.callSid = call.sid;
+    const started = await telephony.createCall(callContext);
+    callContext.providerSessionId = started.providerSessionId;
     pendingCalls.set(token, callContext);
-    return { callSid: call.sid, status: call.status, to: data.to, token };
+    return {
+      callId: callContext.callId,
+      providerSessionId: started.providerSessionId,
+      status: started.status,
+      to: data.to,
+      token,
+      provider: 'voximplant',
+    };
   } catch (error) {
     pendingCalls.delete(token);
     throw error;
@@ -596,105 +607,142 @@ fastify.post('/calls', async (request, reply) => {
   }
 });
 
-fastify.post('/twilio/status/:token', async (request, reply) => {
-  if (!isValidTwilioWebhook(request)) {
-    request.log.warn('Отклонён webhook с неверной подписью Twilio');
-    return reply.code(403).send({ error: 'invalid_twilio_signature' });
-  }
-
-  const { token } = request.params;
-  const context = pendingCalls.get(token) || activeCalls.get(token);
-  const status = request.body?.CallStatus;
-  const callSid = request.body?.CallSid;
-
-  fastify.log.info({ token, callSid, status }, 'Статус звонка');
-  if (context && callSid && !context.callSid) context.callSid = callSid;
-
-  if (['completed', 'busy', 'failed', 'no-answer', 'canceled'].includes(status)) {
-    pendingCalls.delete(token);
-    activeCalls.delete(token);
-    if (context && !context.resultSaved) {
-      await appendResult({
-        callSid: callSid || context.callSid,
-        campaignId: context.campaignId || null,
-        to: context.to,
-        name: context.name,
-        status,
-        summary: `Звонок завершён со статусом ${status}.`,
-        metadata: context.metadata,
-        createdAt: new Date().toISOString(),
-      });
-      context.resultSaved = true;
-    }
-  }
-
-  return reply.code(204).send();
-});
-
 fastify.register(async (scope) => {
-  scope.get('/media-stream/:token', { websocket: true }, async (connection, request) => {
+  scope.get('/voximplant/media/:token', { websocket: true }, async (connection, request) => {
     const { token } = request.params;
-    const callContext = pendingCalls.get(token);
-    if (!callContext) {
-      connection.close(1008, 'Unknown or expired call token');
+    const signature = request.query?.sig;
+    const callContext = pendingCalls.get(token) || activeCalls.get(token);
+
+    if (!callContext || !isAllowedMediaRequest(token, signature)) {
+      connection.close(1008, 'Unknown, expired or unsigned call token');
       return;
     }
 
-    pendingCalls.delete(token);
-    activeCalls.set(token, callContext);
+    callContext.bridgeSocket = connection;
+    let session = null;
+    let realtimeStarted = false;
 
-    const transport = new TwilioRealtimeTransportLayer({ twilioWebSocket: connection });
-    const agent = createAgent(callContext);
-    const session = new RealtimeSession(agent, {
-      transport,
-      model: config.realtimeModel,
-      config: {
-        audio: {
-          input: { turnDetection: { type: 'semantic_vad' } },
-          output: { voice: config.voice },
+    const startRealtime = async () => {
+      if (realtimeStarted) return;
+      realtimeStarted = true;
+
+      pendingCalls.delete(token);
+      activeCalls.set(token, callContext);
+
+      const agent = createAgent(callContext);
+      session = new RealtimeSession(agent, {
+        transport: 'websocket',
+        model: config.realtimeModel,
+        config: {
+          outputModalities: ['audio'],
+          audio: {
+            input: {
+              format: 'g711_ulaw',
+              turnDetection: { type: 'semantic_vad' },
+            },
+            output: {
+              format: 'g711_ulaw',
+              voice: config.voice,
+            },
+          },
         },
-      },
-      workflowName: 'outbound-satpricep-call',
-      traceMetadata: {
-        callToken: token,
-        callSid: callContext.callSid || 'pending',
-        campaignId: callContext.campaignId || 'single',
-      },
-    });
+        workflowName: 'outbound-satpricep-voximplant-call',
+        traceMetadata: {
+          callToken: token,
+          callId: callContext.callId || 'pending',
+          campaignId: callContext.campaignId || 'single',
+          telephonyProvider: 'voximplant',
+        },
+      });
+      callContext.realtimeSession = session;
 
-    session.on('history_updated', (history) => {
-      saveHistory(callContext, history).catch((error) =>
-        fastify.log.error(error, 'Не удалось сохранить историю разговора'),
-      );
-    });
-    session.on('error', (...args) => {
-      fastify.log.error({ args, token }, 'Ошибка Realtime-сессии');
-    });
-    connection.on('close', () => {
-      session.close();
-      activeCalls.delete(token);
-    });
+      session.on('audio', (event) => {
+        if (connection.readyState === 1 && event?.data) {
+          connection.send(Buffer.from(event.data), { binary: true });
+        }
+      });
+      session.on('audio_interrupted', () => {
+        if (connection.readyState === 1) {
+          connection.send(JSON.stringify({ type: 'clear_audio' }));
+        }
+      });
+      session.on('history_updated', (history) => {
+        saveHistory(callContext, history).catch((error) =>
+          fastify.log.error(error, 'Не удалось сохранить историю разговора'),
+        );
+      });
+      session.on('error', (...args) => {
+        fastify.log.error({ args, token }, 'Ошибка Realtime-сессии');
+      });
 
-    try {
       await session.connect({ apiKey: config.openAiApiKey });
-      fastify.log.info({ token, callSid: callContext.callSid }, 'Realtime подключён');
+      fastify.log.info({ token, callId: callContext.callId }, 'OpenAI Realtime подключён');
       session.sendMessage(
         `Начни звонок сейчас. Поздоровайся с ${callContext.name}, представься как AI-ассистент компании «${config.companyName}», кратко объясни цель и спроси, удобно ли говорить. Не называй ни одной характеристики продукции до использования search_catalog.`,
       );
-    } catch (error) {
-      fastify.log.error(error, 'Не удалось подключиться к OpenAI Realtime');
+    };
+
+    const finishCall = async (status, summary = null) => {
+      pendingCalls.delete(token);
       activeCalls.delete(token);
-      connection.close(1011, 'Realtime connection failed');
-    }
+      if (session) session.close();
+
+      if (!callContext.resultSaved) {
+        await appendResult({
+          callId: callContext.callId,
+          providerSessionId: callContext.providerSessionId,
+          campaignId: callContext.campaignId || null,
+          to: callContext.to,
+          name: callContext.name,
+          status,
+          summary: summary || `Звонок завершён со статусом ${status}.`,
+          metadata: callContext.metadata,
+          createdAt: new Date().toISOString(),
+        });
+        callContext.resultSaved = true;
+      }
+    };
+
+    connection.on('message', async (data, isBinary) => {
+      try {
+        if (isBinary) {
+          if (!session) return;
+          const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
+          const audio = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength);
+          session.sendAudio(audio);
+          return;
+        }
+
+        const event = JSON.parse(data.toString());
+        fastify.log.info({ token, event }, 'Voximplant event');
+
+        if (event.callId && !callContext.callId) callContext.callId = String(event.callId);
+
+        if (event.type === 'connected') {
+          await startRealtime();
+        } else if (event.type === 'failed') {
+          await finishCall(event.reason || 'failed', event.message);
+        } else if (event.type === 'disconnected') {
+          await finishCall(event.reason || 'completed');
+        }
+      } catch (error) {
+        fastify.log.error(error, 'Ошибка обработки Voximplant WebSocket');
+      }
+    });
+
+    connection.on('close', () => {
+      if (session) session.close();
+      callContext.bridgeSocket = null;
+      activeCalls.delete(token);
+      pendingCalls.delete(token);
+    });
   });
 });
 
 async function shutdown(signal) {
   fastify.log.info({ signal }, 'Завершение работы');
   for (const context of activeCalls.values()) {
-    if (context.callSid) {
-      twilioClient.calls(context.callSid).update({ status: 'completed' }).catch(() => {});
-    }
+    await telephony.hangup(context).catch(() => {});
   }
   await fastify.close();
   process.exit(0);

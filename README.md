@@ -1,6 +1,6 @@
 # AI-обзвон клиентов САТ — Node.js
 
-MVP исходящих голосовых звонков через **Twilio Voice + OpenAI Realtime API** с двумя ключевыми функциями:
+MVP исходящих голосовых звонков через **Voximplant + OpenAI Realtime API** с двумя ключевыми функциями:
 
 1. пользователь загружает базу клиентов в Excel (`.xlsx`);
 2. любые сведения о продукции агент получает только из каталога `https://www.satpricep.by/catalog/filter/clear/apply/`.
@@ -18,7 +18,7 @@ Excel клиентов
      ↓
 Кэш data/catalog-knowledge.json
      ↓
-Исходящий звонок Twilio
+Voximplant StartScenarios → исходящий PSTN-звонок
      ↓
 OpenAI Realtime Agent
      ↓
@@ -129,7 +129,7 @@ file
 - `data/catalog-knowledge.json` — подтверждённые данные каталога и URL источников;
 - `data/campaigns/<id>.json` — состояние загруженной кампании;
 - `data/call-results.jsonl` — результаты разговоров;
-- `data/calls/<CallSid>.json` — история Realtime-сессии;
+- `data/calls/<CallId>.json` — история Realtime-сессии;
 - `data/do-not-call.json` — стоп-лист.
 
 ## Важные ограничения
@@ -138,3 +138,35 @@ file
 - Сам сайт является динамическим внешним источником и может изменить HTML/антибот-защиту. Перед production нужно добавить мониторинг успешности синхронизации каталога.
 - Для production следует заменить локальные JSON/Map на PostgreSQL и Redis, добавить очередь звонков, роли пользователей, аудит изменений базы знаний и CRM-интеграцию.
 - Перед автоматическим рекламным обзвоном необходимо проверить требования законодательства к согласию, рекламе, записи разговора и обработке персональных данных для конкретной страны.
+
+
+## Voximplant — вариант B
+
+AI и бизнес-логика остаются на Node.js, Voximplant отвечает за PSTN и поток аудио:
+
+```text
+Клиент ↔ PSTN ↔ Voximplant/VoxEngine ↔ WebSocket ↔ Node.js ↔ OpenAI Realtime
+```
+
+### Настройка Voximplant
+
+1. Создайте Application, например `AI_Caller`.
+2. Создайте Scenario и вставьте код из `voximplant/outbound-ai.js`.
+3. Создайте Routing Rule, привяжите к нему этот Scenario и скопируйте ID правила в `VOXIMPLANT_RULE_ID`.
+4. Подключите номер и укажите его в `VOXIMPLANT_PHONE_NUMBER`.
+5. Создайте Management API key и заполните `VOXIMPLANT_ACCOUNT_ID` и `VOXIMPLANT_API_KEY`.
+6. Задайте длинный случайный `VOXIMPLANT_MEDIA_SECRET`.
+7. Укажите публичный HTTPS адрес backend в `PUBLIC_BASE_URL`.
+8. Для первого запуска оставьте `DRY_RUN=true`.
+
+Backend запускает VoxEngine через StartScenarios. Scenario звонит через `VoxEngine.callPSTN()`, затем открывает двусторонний WebSocket к backend.
+
+### Аудио
+
+Мост настроен на G.711 μ-law / 8 kHz с обеих сторон. Voximplant поддерживает ULAW в WebSocket media, а OpenAI Realtime WebSocket позволяет передавать аудио через `session.sendAudio()` и получать его через событие `audio`.
+
+При перебивании backend отправляет управляющее сообщение `clear_audio`, чтобы VoxEngine очистил буфер проигрывания. Tool `end_call` отправляет `hangup` через тот же WebSocket.
+
+### Безопасность
+
+WebSocket URL подписан HMAC на основе `VOXIMPLANT_MEDIA_SECRET`; неизвестные или неподписанные подключения отклоняются. API-ключ Voximplant хранится только в переменных окружения backend и не передаётся в VoxEngine scenario.
