@@ -16,7 +16,6 @@
     "@fastify/multipart": "^9.0.0",
     "@fastify/websocket": "^11.1.0",
     "@openai/agents": "^0.14.0",
-    "@openai/agents-extensions": "^0.14.0",
     "cheerio": "^1.0.0",
     "dotenv": "^16.5.0",
     "exceljs": "^4.4.0",
