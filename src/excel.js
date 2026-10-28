@@ -66,6 +66,7 @@ export async function parseClientsExcel(buffer) {
 
   const clients = [];
   const rejected = [];
+  const seenPhones = new Set();
 
   for (let rowNumber = 2; rowNumber <= sheet.rowCount; rowNumber += 1) {
     const row = sheet.getRow(rowNumber);
@@ -86,6 +87,7 @@ export async function parseClientsExcel(buffer) {
     if (!name) reasons.push('Не указано имя');
     if (!consent) reasons.push('Нет подтверждённого согласия на звонок');
     if (!consentSource) reasons.push('Не указан источник согласия');
+    if (seenPhones.has(phone)) reasons.push('Повторяющийся номер телефона в файле');
 
     if (reasons.length) {
       rejected.push({ row: rowNumber, phone, name, reasons });
@@ -101,6 +103,7 @@ export async function parseClientsExcel(buffer) {
         ? `Рассказать о продукции САТ с учётом интереса клиента к «${product}», ответить на вопросы и определить следующий шаг.`
         : 'Рассказать о продукции САТ, выяснить потребность клиента, ответить на вопросы и определить следующий шаг.');
 
+    seenPhones.add(phone);
     clients.push({
       to: phone,
       name,

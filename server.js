@@ -12,6 +12,8 @@ import { RealtimeAgent, RealtimeSession, tool } from '@openai/agents/realtime';
 import { CatalogKnowledgeBase } from './src/catalog.js';
 import { parseClientsExcel } from './src/excel.js';
 import { VoximplantProvider } from './src/telephony/voximplant.js';
+import { decodeVoxMessage, encodeVoxAudio } from './src/telephony/media.js';
+import { validateCallWindow } from './src/call-policy.js';
 
 const requiredEnv = [
   'OPENAI_API_KEY',
@@ -55,6 +57,11 @@ const config = {
     .filter(Boolean),
   dryRun: String(process.env.DRY_RUN || 'false').toLowerCase() === 'true',
   campaignDelayMs: Number(process.env.CAMPAIGN_DELAY_MS || 3000),
+  pendingTimeoutMs: Number(process.env.PENDING_CALL_TIMEOUT_MS || 90000),
+  maxCallDurationMs: Number(process.env.MAX_CALL_DURATION_MS || 900000),
+  callingTimezone: process.env.CALLING_TIMEZONE || 'Europe/Minsk',
+  callingStartHour: Number(process.env.CALLING_START_HOUR ?? 10),
+  callingEndHour: Number(process.env.CALLING_END_HOUR ?? 18),
   catalogUrl:
     process.env.CATALOG_URL || 'https://www.satpricep.by/catalog/filter/clear/apply/',
   catalogMaxAgeHours: Number(process.env.CATALOG_MAX_AGE_HOURS || 6),
@@ -103,6 +110,22 @@ await catalogKb.load();
 const pendingCalls = new Map();
 const activeCalls = new Map();
 const campaigns = new Map();
+for (const filename of await fs.readdir(CAMPAIGNS_DIR)) {
+  if (!filename.endsWith('.json')) continue;
+  try {
+    const old = JSON.parse(await fs.readFile(path.join(CAMPAIGNS_DIR, filename), 'utf8'));
+    if (!old?.id || !Array.isArray(old.clients)) continue;
+    if (['queued', 'running', 'dialing_finished'].includes(old.status)) {
+      old.status = 'interrupted';
+      old.errors ||= [];
+      old.errors.push({ error: 'server_restarted_manual_review_required' });
+      old.finishedAt = new Date().toISOString();
+      await fs.writeFile(path.join(CAMPAIGNS_DIR, filename), JSON.stringify(old, null, 2));
+    }
+    campaigns.set(old.id, old);
+  } catch (error) { fastify.log.error({ error, filename }, 'Cannot recover campaign'); }
+}
+
 
 const callRequestSchema = z.object({
   to: z.string().regex(/^\+[1-9]\d{7,14}$/, 'Номер должен быть в формате E.164'),
@@ -157,12 +180,19 @@ async function readDncList() {
   }
 }
 
+let dncWriteQueue = Promise.resolve();
 async function addToDnc(phone, reason) {
+  const previous = dncWriteQueue;
+  let release;
+  dncWriteQueue = new Promise((resolve) => { release = resolve; });
+  await previous;
+  try {
   const list = await readDncList();
   if (!list.some((item) => item.phone === phone)) {
     list.push({ phone, reason, createdAt: new Date().toISOString() });
-    await fs.writeFile(DNC_FILE, JSON.stringify(list, null, 2));
+    await fs.writeFile(DNC_FILE, JSON.stringify(list, null, 2), { mode: 0o600 });
   }
+  } finally { release(); }
 }
 
 async function appendResult(result) {
@@ -197,7 +227,7 @@ async function saveHistory(callContext, history) {
 async function persistCampaign(campaign) {
   await fs.writeFile(
     path.join(CAMPAIGNS_DIR, `${campaign.id}.json`),
-    JSON.stringify(campaign, null, 2),
+    JSON.stringify(campaign, null, 2), { mode: 0o600 },
   );
 }
 
@@ -353,6 +383,11 @@ function createAgent(callContext) {
 }
 
 async function createOutboundCall(payload, { campaignId = null } = {}) {
+  if (!config.dryRun && !validateCallWindow(new Date(), { timezone: config.callingTimezone, startHour: config.callingStartHour, endHour: config.callingEndHour })) {
+    const error = new Error('calling_hours_restricted');
+    error.statusCode = 403;
+    throw error;
+  }
   const parsed = callRequestSchema.safeParse(payload);
   if (!parsed.success) {
     const error = new Error('validation_error');
@@ -368,6 +403,7 @@ async function createOutboundCall(payload, { campaignId = null } = {}) {
     throw error;
   }
 
+  await dncWriteQueue;
   const dncList = await readDncList();
   if (dncList.some((item) => item.phone === data.to)) {
     const error = new Error('number_in_do_not_call_list');
@@ -384,6 +420,9 @@ async function createOutboundCall(payload, { campaignId = null } = {}) {
   const token = crypto.randomBytes(16).toString('hex');
   const callContext = {
     token,
+    pendingTimer: null,
+    durationTimer: null,
+    finished: false,
     campaignId,
     to: data.to,
     name: data.name,
@@ -399,9 +438,25 @@ async function createOutboundCall(payload, { campaignId = null } = {}) {
   };
 
   pendingCalls.set(token, callContext);
+  callContext.pendingTimer = setTimeout(() => {
+    if (pendingCalls.get(token) === callContext) {
+      pendingCalls.delete(token);
+      callContext.finished = true;
+      appendResult({ campaignId, to: callContext.to, name: callContext.name, status: 'connection_timeout', createdAt: new Date().toISOString() }).catch((error) => fastify.log.error(error));
+      if (campaignId && campaigns.has(campaignId)) {
+        const c = campaigns.get(campaignId);
+        c.progress.completed += 1; c.progress.failed += 1;
+        if (c.status === 'dialing_finished' && c.progress.completed >= c.progress.total) { c.status = 'completed'; c.finishedAt = new Date().toISOString(); }
+        persistCampaign(c).catch((error) => fastify.log.error(error));
+      }
+      telephony.hangup(callContext).catch(() => {});
+    }
+  }, config.pendingTimeoutMs);
+  callContext.pendingTimer.unref?.();
 
   if (config.dryRun) {
     pendingCalls.delete(token);
+    clearTimeout(callContext.pendingTimer);
     return {
       dryRun: true,
       token,
@@ -414,6 +469,12 @@ async function createOutboundCall(payload, { campaignId = null } = {}) {
   try {
     const started = await telephony.createCall(callContext);
     callContext.providerSessionId = started.providerSessionId;
+    if (callContext.finished) {
+      await telephony.hangup(callContext).catch(() => {});
+      const error = new Error('connection_timeout');
+      error.statusCode = 504;
+      throw error;
+    }
     pendingCalls.set(token, callContext);
     return {
       callId: callContext.callId,
@@ -425,6 +486,7 @@ async function createOutboundCall(payload, { campaignId = null } = {}) {
     };
   } catch (error) {
     pendingCalls.delete(token);
+    clearTimeout(callContext.pendingTimer);
     throw error;
   }
 }
@@ -443,10 +505,11 @@ async function runCampaign(campaign) {
   for (const [index, client] of campaign.clients.entries()) {
     if (campaign.status === 'stopped') break;
     await waitForCallSlot();
+    if (campaign.status === 'stopped') break;
     try {
       const result = await createOutboundCall(client, { campaignId: campaign.id });
-      campaign.progress.completed += 1;
       campaign.progress.started += 1;
+      if (config.dryRun) campaign.progress.completed += 1;
       campaign.progress.last = { row: client.metadata?.excelRow, phone: client.to, result };
     } catch (error) {
       campaign.progress.completed += 1;
@@ -463,8 +526,8 @@ async function runCampaign(campaign) {
     }
   }
 
-  if (campaign.status !== 'stopped') campaign.status = 'completed';
-  campaign.finishedAt = new Date().toISOString();
+  if (campaign.status !== 'stopped') campaign.status = (config.dryRun || campaign.progress.completed >= campaign.progress.total) ? 'completed' : 'dialing_finished';
+  if (campaign.status === 'completed' || campaign.status === 'stopped') campaign.finishedAt = new Date().toISOString();
   await persistCampaign(campaign);
 }
 
@@ -536,6 +599,16 @@ fastify.post('/campaigns/upload', async (request, reply) => {
   } catch (error) {
     return reply.code(400).send({ error: 'invalid_excel', message: error.message });
   }
+});
+
+fastify.post('/campaigns/:id/stop', async (request, reply) => {
+  if (!assertInternalApiKey(request, reply)) return;
+  const campaign = campaigns.get(request.params.id);
+  if (!campaign) return reply.code(404).send({ error: 'campaign_not_found' });
+  if (!['queued', 'running'].includes(campaign.status)) return reply.code(409).send({ error: 'campaign_not_running' });
+  campaign.status = 'stopped';
+  await persistCampaign(campaign);
+  return { ok: true, status: campaign.status };
 });
 
 fastify.get('/campaigns/:id', async (request, reply) => {
@@ -623,11 +696,17 @@ fastify.register(async (scope) => {
     let realtimeStarted = false;
 
     const startRealtime = async () => {
-      if (realtimeStarted) return;
+      if (realtimeStarted || callContext.finished) return;
       realtimeStarted = true;
 
       pendingCalls.delete(token);
+      clearTimeout(callContext.pendingTimer);
       activeCalls.set(token, callContext);
+      callContext.durationTimer = setTimeout(() => {
+        telephony.hangup(callContext).catch(() => {});
+        connection.close(1000, 'call_duration_limit');
+      }, config.maxCallDurationMs);
+      callContext.durationTimer.unref?.();
 
       const agent = createAgent(callContext);
       session = new RealtimeSession(agent, {
@@ -658,7 +737,8 @@ fastify.register(async (scope) => {
 
       session.on('audio', (event) => {
         if (connection.readyState === 1 && event?.data) {
-          connection.send(Buffer.from(event.data), { binary: true });
+          try { connection.send(encodeVoxAudio(event.data)); }
+          catch (error) { fastify.log.error(error, 'Invalid outgoing audio'); }
         }
       });
       session.on('audio_interrupted', () => {
@@ -683,6 +763,10 @@ fastify.register(async (scope) => {
     };
 
     const finishCall = async (status, summary = null) => {
+      if (callContext.finished) return;
+      callContext.finished = true;
+      clearTimeout(callContext.pendingTimer);
+      clearTimeout(callContext.durationTimer);
       pendingCalls.delete(token);
       activeCalls.delete(token);
       if (session) session.close();
@@ -701,19 +785,27 @@ fastify.register(async (scope) => {
         });
         callContext.resultSaved = true;
       }
+      if (callContext.campaignId) {
+        const campaign = campaigns.get(callContext.campaignId);
+        if (campaign) {
+          campaign.progress.completed += 1;
+          if (['failed', 'connection_timeout'].includes(status)) campaign.progress.failed += 1;
+          if (campaign.status === 'dialing_finished' && campaign.progress.completed >= campaign.progress.total) {
+            campaign.status = 'completed'; campaign.finishedAt = new Date().toISOString();
+          }
+          await persistCampaign(campaign);
+        }
+      }
     };
 
     connection.on('message', async (data, isBinary) => {
       try {
-        if (isBinary) {
-          if (!session) return;
-          const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
-          const audio = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength);
-          session.sendAudio(audio);
+        const decoded = decodeVoxMessage(data, isBinary);
+        if (decoded.kind === 'audio') {
+          if (session?.transport && !callContext.finished) session.sendAudio(decoded.audio);
           return;
         }
-
-        const event = JSON.parse(data.toString());
+        const event = decoded.event;
         fastify.log.info({ token, event }, 'Voximplant event');
 
         if (event.callId && !callContext.callId) callContext.callId = String(event.callId);
@@ -731,10 +823,8 @@ fastify.register(async (scope) => {
     });
 
     connection.on('close', () => {
-      if (session) session.close();
       callContext.bridgeSocket = null;
-      activeCalls.delete(token);
-      pendingCalls.delete(token);
+      finishCall('connection_closed').catch((error) => fastify.log.error(error, 'Cannot finalize disconnected call'));
     });
   });
 });

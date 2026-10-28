@@ -1,6 +1,7 @@
 node_modules/
 .env
-data/calls/*.json
-data/call-results.jsonl
-data/do-not-call.json
+.env.*
+!.env.example
+data/
+*.log
 npm-debug.log*
