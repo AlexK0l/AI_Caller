@@ -213,11 +213,16 @@ export class CatalogKnowledgeBase {
       }
     }
 
+    // Reject successful HTTP responses that contain no actual product cards.
+    // This prevents an empty/blocked catalogue page from being marked fresh.
+    if (uniqueCards.length === 0 || productDocs.length === 0) {
+      throw new Error('catalog_sync_no_product_cards');
+    }
     const now = new Date().toISOString();
-    this.documents = uniqueBy([...productDocs, ...catalogDocs], (item) => `${item.kind}:${item.url}`)
+    const documents = uniqueBy([...productDocs, ...catalogDocs], (item) => `${item.kind}:${item.url}`)
       .filter((item) => item.text && item.text.length > 20)
       .map((item) => ({ ...item, fetchedAt: now, source: 'satpricep.by' }));
-    this.updatedAt = now;
+    if (!documents.length) throw new Error('catalog_sync_empty');
 
     await fs.writeFile(
       this.dataFile,
@@ -225,13 +230,15 @@ export class CatalogKnowledgeBase {
         {
           source: this.catalogUrl,
           updatedAt: now,
-          documents: this.documents,
+          documents,
         },
         null,
         2,
       ),
     );
 
+    this.documents = documents;
+    this.updatedAt = now;
     return this.status();
   }
 
