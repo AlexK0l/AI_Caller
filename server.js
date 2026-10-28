@@ -13,6 +13,7 @@ import { CatalogKnowledgeBase } from './src/catalog.js';
 import { parseClientsExcel } from './src/excel.js';
 import { VoximplantProvider } from './src/telephony/voximplant.js';
 import { decodeVoxMessage, encodeVoxAudio } from './src/telephony/media.js';
+import { validateCallWindow } from './src/call-policy.js';
 
 const requiredEnv = [
   'OPENAI_API_KEY',
@@ -58,6 +59,9 @@ const config = {
   campaignDelayMs: Number(process.env.CAMPAIGN_DELAY_MS || 3000),
   pendingTimeoutMs: Number(process.env.PENDING_CALL_TIMEOUT_MS || 90000),
   maxCallDurationMs: Number(process.env.MAX_CALL_DURATION_MS || 900000),
+  callingTimezone: process.env.CALLING_TIMEZONE || 'Europe/Minsk',
+  callingStartHour: Number(process.env.CALLING_START_HOUR ?? 10),
+  callingEndHour: Number(process.env.CALLING_END_HOUR ?? 18),
   catalogUrl:
     process.env.CATALOG_URL || 'https://www.satpricep.by/catalog/filter/clear/apply/',
   catalogMaxAgeHours: Number(process.env.CATALOG_MAX_AGE_HOURS || 6),
@@ -379,6 +383,11 @@ function createAgent(callContext) {
 }
 
 async function createOutboundCall(payload, { campaignId = null } = {}) {
+  if (!config.dryRun && !validateCallWindow(new Date(), { timezone: config.callingTimezone, startHour: config.callingStartHour, endHour: config.callingEndHour })) {
+    const error = new Error('calling_hours_restricted');
+    error.statusCode = 403;
+    throw error;
+  }
   const parsed = callRequestSchema.safeParse(payload);
   if (!parsed.success) {
     const error = new Error('validation_error');
@@ -394,6 +403,7 @@ async function createOutboundCall(payload, { campaignId = null } = {}) {
     throw error;
   }
 
+  await dncWriteQueue;
   const dncList = await readDncList();
   if (dncList.some((item) => item.phone === data.to)) {
     const error = new Error('number_in_do_not_call_list');
@@ -433,6 +443,12 @@ async function createOutboundCall(payload, { campaignId = null } = {}) {
       pendingCalls.delete(token);
       callContext.finished = true;
       appendResult({ campaignId, to: callContext.to, name: callContext.name, status: 'connection_timeout', createdAt: new Date().toISOString() }).catch((error) => fastify.log.error(error));
+      if (campaignId && campaigns.has(campaignId)) {
+        const c = campaigns.get(campaignId);
+        c.progress.completed += 1; c.progress.failed += 1;
+        if (c.status === 'dialing_finished' && c.progress.completed >= c.progress.total) { c.status = 'completed'; c.finishedAt = new Date().toISOString(); }
+        persistCampaign(c).catch((error) => fastify.log.error(error));
+      }
       telephony.hangup(callContext).catch(() => {});
     }
   }, config.pendingTimeoutMs);
@@ -505,7 +521,7 @@ async function runCampaign(campaign) {
   }
 
   if (campaign.status !== 'stopped') campaign.status = config.dryRun ? 'completed' : 'dialing_finished';
-  campaign.finishedAt = new Date().toISOString();
+  if (campaign.status === 'completed' || campaign.status === 'stopped') campaign.finishedAt = new Date().toISOString();
   await persistCampaign(campaign);
 }
 
@@ -674,7 +690,7 @@ fastify.register(async (scope) => {
     let realtimeStarted = false;
 
     const startRealtime = async () => {
-      if (realtimeStarted) return;
+      if (realtimeStarted || callContext.finished) return;
       realtimeStarted = true;
 
       pendingCalls.delete(token);
@@ -780,7 +796,7 @@ fastify.register(async (scope) => {
       try {
         const decoded = decodeVoxMessage(data, isBinary);
         if (decoded.kind === 'audio') {
-          if (session) session.sendAudio(decoded.audio);
+          if (session?.transport && !callContext.finished) session.sendAudio(decoded.audio);
           return;
         }
         const event = decoded.event;
