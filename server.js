@@ -520,7 +520,7 @@ async function runCampaign(campaign) {
     }
   }
 
-  if (campaign.status !== 'stopped') campaign.status = config.dryRun ? 'completed' : 'dialing_finished';
+  if (campaign.status !== 'stopped') campaign.status = (config.dryRun || campaign.progress.completed >= campaign.progress.total) ? 'completed' : 'dialing_finished';
   if (campaign.status === 'completed' || campaign.status === 'stopped') campaign.finishedAt = new Date().toISOString();
   await persistCampaign(campaign);
 }
