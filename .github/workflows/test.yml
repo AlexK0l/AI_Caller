@@ -11,4 +11,7 @@ jobs:
         with:
           node-version: '22'
       - run: npm install --no-audit --no-fund
+      - run: node --check server.js
+      - run: node --check src/catalog.js
+      - run: node --check src/telephony/voximplant.js
       - run: npm test
