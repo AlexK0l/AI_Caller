@@ -469,6 +469,12 @@ async function createOutboundCall(payload, { campaignId = null } = {}) {
   try {
     const started = await telephony.createCall(callContext);
     callContext.providerSessionId = started.providerSessionId;
+    if (callContext.finished) {
+      await telephony.hangup(callContext).catch(() => {});
+      const error = new Error('connection_timeout');
+      error.statusCode = 504;
+      throw error;
+    }
     pendingCalls.set(token, callContext);
     return {
       callId: callContext.callId,
