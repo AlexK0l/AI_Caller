@@ -38,6 +38,7 @@
 
   <div class="card">
     <button id="start" disabled>Запустить обзвон</button>
+    <button id="stop" class="secondary" disabled>Остановить кампанию</button>
     <pre id="result">Кампания ещё не загружена.</pre>
   </div>
 
@@ -69,7 +70,8 @@ async function refreshCampaign() {
   try {
     const data = await jsonFetch(`/campaigns/${campaignId}`);
     result.textContent = JSON.stringify(data, null, 2);
-    if (['queued','running'].includes(data.status)) setTimeout(refreshCampaign, 2000);
+    document.getElementById('stop').disabled = !['queued','running'].includes(data.status);
+    if (['queued','running','dialing_finished'].includes(data.status)) setTimeout(refreshCampaign, 2000);
   } catch (e) { result.textContent = e.message; }
 }
 
@@ -97,6 +99,16 @@ document.getElementById('start').onclick = async () => {
     result.textContent = e.message;
     document.getElementById('start').disabled = false;
   }
+};
+
+document.getElementById('stop').onclick = async () => {
+  if (!campaignId) return;
+  try {
+    const data = await jsonFetch(`/campaigns/${campaignId}/stop`, {method: 'POST'});
+    result.textContent = JSON.stringify(data, null, 2);
+    document.getElementById('stop').disabled = true;
+    refreshCampaign();
+  } catch(e) { result.textContent = e.message; }
 };
 
 document.getElementById('sync').onclick = async () => {
