@@ -37,7 +37,6 @@ export class VoximplantProvider {
 
   async createCall(callContext) {
     const scenarioData = JSON.stringify({
-      t: callContext.token,
       to: callContext.to,
       from: this.fromNumber,
       ws: this.buildMediaUrl(callContext.token),
